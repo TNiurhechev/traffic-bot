@@ -3,10 +3,11 @@ import threading
 import logging
 import math
 import requests
+import psycopg2
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from timezonefinder import TimezoneFinder
-from datetime import time
+from datetime import time, datetime
 from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw
 from io import BytesIO
@@ -20,6 +21,7 @@ logging.basicConfig(
 load_dotenv()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_KEY = os.environ.get("API_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 tf = TimezoneFinder()
 
 
@@ -34,6 +36,57 @@ def start_health_check():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
+
+def init_db():
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    chat_id BIGINT PRIMARY KEY,
+                    city TEXT NOT NULL,
+                    time_str TEXT NOT NULL,
+                    tz_str TEXT NOT NULL
+                );
+            """)
+
+def save_subscription(chat_id: int, city: str, time_str: str, tz_str: str):
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO subscriptions (chat_id, city, time_str, tz_str)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (chat_id) 
+                DO UPDATE SET city = EXCLUDED.city, time_str = EXCLUDED.time_str, tz_str = EXCLUDED.tz_str;
+            """, (chat_id, city, time_str, tz_str))
+
+def remove_subscription(chat_id: int):
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM subscriptions WHERE chat_id = %s;", (chat_id,))
+
+def restore_subscriptions(app):
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT chat_id, city, time_str, tz_str FROM subscriptions;")
+            rows = cur.fetchall()
+            for chat_id, city, time_str, tz_str in rows:
+                hour, minute = map(int, time_str.split(":"))
+                tz = ZoneInfo(tz_str)
+                target_time = time(hour=hour, minute=minute, tzinfo=tz)
+                job_name = f"daily_traffic_{chat_id}"
+
+                app.job_queue.run_daily(
+                    send_daily_traffic_job,
+                    time=target_time,
+                    chat_id=chat_id,
+                    name=job_name,
+                    data={
+                        "chat_id": chat_id,
+                        "city": city,
+                        "time_str": time_str,
+                        "tz_str": tz_str
+                    }
+                )
 
 def latlon_to_tile(lat, lon, zoom):
     n = 2 ** zoom
@@ -456,7 +509,7 @@ async def setdaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_jobs = context.job_queue.get_jobs_by_name(job_name)
     for j in current_jobs:
         j.schedule_removal()
-
+    save_subscription(chat_id, city, time_str, tz_str)
     context.job_queue.run_daily(
         send_daily_traffic_job,
         time=target_time,
@@ -480,17 +533,20 @@ async def setdaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def viewdaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    job_name = f"daily_traffic_{chat_id}"
 
-    current_jobs = context.job_queue.get_jobs_by_name(job_name)
-    if not current_jobs:
-        await update.message.reply_text("You don't have any active daily traffic subscriptions.\nSet one with `/setdaily <city> <HH:MM>`", parse_mode="Markdown")
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT city, time_str, tz_str FROM subscriptions WHERE chat_id = %s;", (chat_id,))
+            row = cur.fetchone()
+
+    if not row:
+        await update.message.reply_text(
+            "You don't have any active daily traffic subscriptions.\nSet one with `/setdaily <city> <HH:MM>`",
+            parse_mode="Markdown"
+        )
         return
 
-    job_data = current_jobs[0].data
-    city = job_data["city"]
-    time_str = job_data["time_str"]
-    tz_str = job_data["tz_str"]
+    city, time_str, tz_str = row
 
     await update.message.reply_text(
         f"📅 <b>Your Current Daily Subscription:</b>\n\n"
@@ -499,11 +555,10 @@ async def viewdaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-
 async def canceldaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     job_name = f"daily_traffic_{chat_id}"
-
+    remove_subscription(chat_id)
     current_jobs = context.job_queue.get_jobs_by_name(job_name)
     if not current_jobs:
         await update.message.reply_text("You don't have an active daily subscription to cancel.")
@@ -549,6 +604,7 @@ async def traffic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     threading.Thread(target=start_health_check, daemon=True).start()
+    init_db()
     persistence = PicklePersistence(filepath="bot_persistence.pickle")
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).build()
     app.add_handler(CommandHandler("start", start))
@@ -556,6 +612,7 @@ def main():
     app.add_handler(CommandHandler("setdaily", setdaily_command))
     app.add_handler(CommandHandler("viewdaily", viewdaily_command))
     app.add_handler(CommandHandler("canceldaily", canceldaily_command))
+    restore_subscriptions(app)
     print("Bot`s running.")
     app.run_polling()
 if __name__ == "__main__":

@@ -3,3 +3,4 @@ timezonefinder
 Pillow
 requests
 python-dotenv
+psycopg2-binary
