@@ -245,7 +245,7 @@ def generate_traffic_map(
 
         draw = ImageDraw.Draw(result)
 
-        for marker_lon, marker_lat, number in jam_markers:
+        for marker_lon, marker_lat, number, is_heavy in jam_markers:
 
             marker_x, marker_y = latlon_to_tile(
                 marker_lat,
@@ -269,9 +269,7 @@ def generate_traffic_map(
                 and 0 <= pixel_y < height
             ):
                 continue
-
             radius = 16
-
             draw.ellipse(
                 (
                     pixel_x - radius - 2,
@@ -282,6 +280,8 @@ def generate_traffic_map(
                 fill=(255, 255, 255, 255)
             )
 
+            pin_fill = (220, 40, 40, 255) if is_heavy else (245, 140, 0, 255)
+
             draw.ellipse(
                 (
                     pixel_x - radius,
@@ -289,7 +289,7 @@ def generate_traffic_map(
                     pixel_x + radius,
                     pixel_y + radius
                 ),
-                fill=(220, 40, 40, 255)
+                fill=pin_fill
             )
 
             text = str(number)
@@ -350,8 +350,7 @@ def fetch_city_jams_and_map(city_name: str):
         inc_res = requests.get(incident_url, params=params).json()
         incidents = inc_res.get("incidents", [])
 
-        jam_lines = []
-        jam_markers = []
+        raw_jams = []
 
         for inc in incidents:
             props = inc.get("properties", {})
@@ -371,15 +370,9 @@ def fetch_city_jams_and_map(city_name: str):
             geom = inc.get("geometry", {})
             coords = geom.get("coordinates", [])
 
+            mid_point = None
             if coords and geom.get("type") == "LineString":
                 mid_point = coords[len(coords) // 2]
-                jam_markers.append(
-                    (
-                        mid_point[0],
-                        mid_point[1],
-                        len(jam_markers) + 1
-                    )
-                )
 
             delay_min = round(delay_sec / 60)
             length_km = round(length_meters / 1000, 1)
@@ -392,22 +385,46 @@ def fetch_city_jams_and_map(city_name: str):
             else:
                 loc_str = "Unknown location"
 
+            raw_jams.append({
+                "delay_min": delay_min,
+                "length_km": length_km,
+                "loc_str": loc_str,
+                "mid_point": mid_point
+            })
+
+        if not raw_jams:
+            return [f"🟢 <b>Traffic Report for {city_name.title()}</b>\n\nNo traffic jams reported right now!"], None
+
+        raw_jams.sort(key=lambda x: x["delay_min"], reverse=True)
+
+        jam_lines = []
+        jam_markers = []
+
+        for number, jam in enumerate(raw_jams, 1):
+            is_heavy = jam["delay_min"] >= 10
+            emoji = "🔴" if is_heavy else "🟠"
+
+            if jam["mid_point"]:
+                jam_markers.append(
+                    (
+                        jam["mid_point"][0],
+                        jam["mid_point"][1],
+                        number,
+                        is_heavy
+                    )
+                )
+
             stats = []
-            if delay_min > 0:
-                stats.append(f"+{delay_min} min delay")
-            if length_km > 0:
-                stats.append(f"{length_km} km queue")
+            if jam["delay_min"] > 0:
+                stats.append(f"+{jam['delay_min']} min delay")
+            if jam["length_km"] > 0:
+                stats.append(f"{jam['length_km']} km queue")
             stats_str = f" <b>({', '.join(stats)})</b>" if stats else ""
 
-            jam_number = len(jam_lines) + 1
-
             jam_lines.append(
-                f"🔴 <b>Traffic Jam #{jam_number}</b> "
-                f"{loc_str}{stats_str}"
+                f"{emoji} <b>Traffic Jam #{number}</b> "
+                f"{jam['loc_str']}{stats_str}"
             )
-
-        if not jam_lines:
-            return [f"🟢 <b>Traffic Report for {city_name.title()}</b>\n\nNo traffic jams reported right now!"], None
 
         photo_bytes = generate_traffic_map(
             lat,
