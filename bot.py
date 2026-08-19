@@ -59,7 +59,8 @@ async def check_traffic_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     city = data["city"]
     min_delay = data["min_delay"]
-    seen_jams = data["seen_jams"]
+    show_repeating = data.get("show_repeating", True)
+    seen_jams = data.get("seen_jams", set())
 
     try:
         geo_url = f"https://api.tomtom.com/search/2/geocode/{city}.json"
@@ -105,13 +106,16 @@ async def check_traffic_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             jam_id = props.get("id") or f"{props.get('from')}-{props.get('to')}"
             current_jam_ids.add(jam_id)
 
-            if jam_id not in seen_jams:
+            is_new = jam_id not in seen_jams
+            if show_repeating or is_new:
                 from_loc = props.get("from", "Unknown")
                 to_loc = props.get("to", "Unknown")
                 length_km = round((props.get("length") or 0) / 1000, 1)
 
+                status_tag = "Ongoing" if not is_new else "New"
+
                 new_alerts.append(
-                    f"🚨 <b>Traffic Alert for {city.title()}!</b>\n"
+                    f"🚨 <b>Traffic Alert ({status_tag}) - {city.title()}</b>\n"
                     f"• <b>Location:</b> between <i>{from_loc}</i> and <i>{to_loc}</i>\n"
                     f"• <b>Delay:</b> +{delay_min} min\n"
                     f"• <b>Queue Length:</b> {length_km} km"
@@ -131,18 +135,39 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: <code>/setreminder &lt;city&gt; &lt;min_delay_minutes&gt;</code>\n"
-            "Example: <code>/setreminder Kyiv 10</code>",
+            "Usage: <code>/setreminder &lt;city&gt; &lt;min_delay&gt; [interval_min] [show_repeating]</code>\n\n"
+            "Examples:\n"
+            "• Default (every 5 min, repeats on): <code>/setreminder London 5</code>\n"
+            "• Check every 10 min: <code>/setreminder London 5 10</code>\n"
+            "• New jams only (no repeats every 5 min): <code>/setreminder London 5 5 false</code>",
             parse_mode="HTML"
         )
         return
 
     city = context.args[0]
+
     try:
         min_delay = int(context.args[1])
     except ValueError:
         await update.message.reply_text("Please provide a valid number for delay minutes.")
         return
+
+    interval_min = 5
+    show_repeating = True
+
+    if len(context.args) >= 3:
+        try:
+            interval_min = int(context.args[2])
+            if interval_min < 1:
+                interval_min = 1
+        except ValueError:
+            await update.message.reply_text("Interval must be a valid number of minutes.")
+            return
+
+    if len(context.args) >= 4:
+        show_repeating = context.args[3].lower() in ("true", "1", "yes", "y", "t")
+
+    interval_sec = interval_min * 60
 
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     for job in current_jobs:
@@ -151,19 +176,26 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     USER_REMINDERS[chat_id] = {
         "city": city,
         "min_delay": min_delay,
+        "interval": interval_sec,
+        "show_repeating": show_repeating,
         "seen_jams": set()
     }
 
     context.job_queue.run_repeating(
         check_traffic_job,
-        interval=300,
+        interval=interval_sec,
         first=5,
         chat_id=chat_id,
         name=str(chat_id)
     )
 
+    repeat_status = "Enabled" if show_repeating else "Disabled (New jams only)"
     await update.message.reply_text(
-        f"🔔 Reminder set! Monitoring <b>{city.title()}</b> every 5 minutes for jams delayed by <b>{min_delay}+ min</b>.",
+        f"🔔 Reminder set!\n\n"
+        f"• <b>City:</b> {city.title()}\n"
+        f"• <b>Threshold:</b> {min_delay}+ min delay\n"
+        f"• <b>Check Frequency:</b> Every {interval_min} min\n"
+        f"• <b>Repeated Alerts:</b> {repeat_status}",
         parse_mode="HTML"
     )
 
@@ -721,12 +753,16 @@ async def canceldaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot started.\n"
-                                    "To look up traffic jams, type /traffic {city name}.\n"
+                                    "To look up traffic jams, type /traffic city_name.\n"
                                     "E.g.: /traffic Warsaw\n"
-                                    "To set daily notifications, type /setdaily {city name} {time}\n"
-                                    "E.g.: /setdaily London 07:30\n"
+                                    "Set up daily traffic reports with /setdaily city_name time\n"
+                                    "E.g.: /setdaily Freiburg 07:00\n"
                                     "To view current subscription, use /viewdaily\n"
-                                    "Cancel your subscription at any time with /canceldaily", parse_mode="HTML")
+                                    "Cancel your subscription at any time with /canceldaily/n"
+                                    "Set up frequent text reports, use /setreminder city_name min_delay "
+                                    "[frequency] [show_repeating]\n"
+                                    "E.g.: /setreminder London 5 30 false\n"
+                                    , parse_mode="HTML")
 
 
 async def traffic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
