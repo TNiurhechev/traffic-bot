@@ -22,6 +22,19 @@ load_dotenv()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_KEY = os.environ.get("API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+HELP_TEXT = (
+    " <b>Bot Help & Commands</b>\n\n"
+    "• <b>Look up traffic:</b> <code>/traffic &lt;city&gt;</code>\n"
+    "  E.g.: <code>/traffic Warsaw</code>\n\n"
+    "• <b>Daily reports:</b> <code>/setdaily &lt;city&gt; &lt;time&gt;</code>\n"
+    "  E.g.: <code>/setdaily Freiburg 07:00</code>\n\n"
+    "• <b>View subscription:</b> <code>/viewdaily</code>\n"
+    "• <b>Cancel subscription:</b> <code>/canceldaily</code>\n\n"
+    "• <b>Live traffic monitoring:</b> <code>/setreminder &lt;city&gt; &lt;min_delay&gt; [interval_min] [show_repeating]</code>\n"
+    "  E.g.: <code>/setreminder London 5 10 false</code>\n\n"
+    "• <b>Stop live monitoring:</b> <code>/stopreminder</code>\n"
+    "• <b>Show help menu:</b> <code>/info</code>"
+)
 tf = TimezoneFinder()
 USER_REMINDERS = {}
 
@@ -751,19 +764,13 @@ async def canceldaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text("❌ Your daily traffic subscription has been canceled.")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot started.\n"
-                                    "To look up traffic jams, type /traffic city_name.\n"
-                                    "E.g.: /traffic Warsaw\n"
-                                    "Set up daily traffic reports with /setdaily city_name time\n"
-                                    "E.g.: /setdaily Freiburg 07:00\n"
-                                    "To view current subscription, use /viewdaily\n"
-                                    "Cancel your subscription at any time with /canceldaily/n"
-                                    "Set up frequent text reports, use /setreminder city_name min_delay "
-                                    "[frequency] [show_repeating]\n"
-                                    "E.g.: /setreminder London 5 30 false\n"
-                                    , parse_mode="HTML")
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
+
+
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 async def traffic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -788,6 +795,7 @@ async def traffic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg.message_id)
 
+
 def main():
     threading.Thread(target=start_health_check, daemon=True).start()
     init_db()
@@ -800,8 +808,11 @@ def main():
     app.add_handler(CommandHandler("canceldaily", canceldaily_command))
     app.add_handler(CommandHandler("setreminder", set_reminder))
     app.add_handler(CommandHandler("stopreminder", stop_reminder))
+    app.add_handler(CommandHandler("info", info))
     restore_subscriptions(app)
     print("Bot`s running.")
     app.run_polling()
+
+
 if __name__ == "__main__":
     main()
