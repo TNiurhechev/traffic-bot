@@ -23,7 +23,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_KEY = os.environ.get("API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 tf = TimezoneFinder()
-
+USER_REMINDERS = {}
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -48,6 +48,139 @@ def init_db():
                     tz_str TEXT NOT NULL
                 );
             """)
+
+async def check_traffic_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    chat_id = job.chat_id
+    data = USER_REMINDERS.get(chat_id)
+
+    if not data:
+        return
+
+    city = data["city"]
+    min_delay = data["min_delay"]
+    seen_jams = data["seen_jams"]
+
+    try:
+        geo_url = f"https://api.tomtom.com/search/2/geocode/{city}.json"
+        geo_res = requests.get(geo_url, params={"key": API_KEY, "limit": 1}).json()
+        results = geo_res.get("results")
+        if not results:
+            return
+
+        pos = results[0]["position"]
+        lat, lon = pos["lat"], pos["lon"]
+
+        delta = 0.12
+        bbox = f"{lon - delta},{lat - delta},{lon + delta},{lat + delta}"
+
+        incident_url = "https://api.tomtom.com/traffic/services/5/incidentDetails"
+        params = {
+            "key": API_KEY,
+            "bbox": bbox,
+            "fields": "{incidents{properties{id,iconCategory,delay,events{description},from,to,length}}}",
+            "language": "en-GB",
+            "timeValidityFilter": "present"
+        }
+        inc_res = requests.get(incident_url, params=params).json()
+        incidents = inc_res.get("incidents", [])
+
+        current_jam_ids = set()
+        new_alerts = []
+
+        for inc in incidents:
+            props = inc.get("properties", {})
+            icon_cat = props.get("iconCategory")
+            events = props.get("events") or []
+            desc = events[0].get("description", "").lower() if events else ""
+
+            is_jam = (icon_cat == 6) or ("jam" in desc) or ("traffic" in desc) or ("queue" in desc)
+            if not is_jam:
+                continue
+
+            delay_min = round((props.get("delay") or 0) / 60)
+            if delay_min < min_delay:
+                continue
+
+            jam_id = props.get("id") or f"{props.get('from')}-{props.get('to')}"
+            current_jam_ids.add(jam_id)
+
+            if jam_id not in seen_jams:
+                from_loc = props.get("from", "Unknown")
+                to_loc = props.get("to", "Unknown")
+                length_km = round((props.get("length") or 0) / 1000, 1)
+
+                new_alerts.append(
+                    f"🚨 <b>Traffic Alert for {city.title()}!</b>\n"
+                    f"• <b>Location:</b> between <i>{from_loc}</i> and <i>{to_loc}</i>\n"
+                    f"• <b>Delay:</b> +{delay_min} min\n"
+                    f"• <b>Queue Length:</b> {length_km} km"
+                )
+
+        USER_REMINDERS[chat_id]["seen_jams"] = current_jam_ids
+
+        for alert in new_alerts:
+            await context.bot.send_message(chat_id=chat_id, text=alert, parse_mode="HTML")
+
+    except Exception as e:
+        logging.error(f"Error in traffic reminder job: {e}")
+
+
+async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_message.chat_id
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: <code>/setreminder &lt;city&gt; &lt;min_delay_minutes&gt;</code>\n"
+            "Example: <code>/setreminder Kyiv 10</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    city = context.args[0]
+    try:
+        min_delay = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Please provide a valid number for delay minutes.")
+        return
+
+    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    for job in current_jobs:
+        job.schedule_removal()
+
+    USER_REMINDERS[chat_id] = {
+        "city": city,
+        "min_delay": min_delay,
+        "seen_jams": set()
+    }
+
+    context.job_queue.run_repeating(
+        check_traffic_job,
+        interval=300,
+        first=5,
+        chat_id=chat_id,
+        name=str(chat_id)
+    )
+
+    await update.message.reply_text(
+        f"🔔 Reminder set! Monitoring <b>{city.title()}</b> every 5 minutes for jams delayed by <b>{min_delay}+ min</b>.",
+        parse_mode="HTML"
+    )
+
+
+async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_message.chat_id
+    jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+
+    if not jobs:
+        await update.message.reply_text("You don't have any active traffic reminders.")
+        return
+
+    for job in jobs:
+        job.schedule_removal()
+
+    USER_REMINDERS.pop(chat_id, None)
+    await update.message.reply_text("🔕 Traffic reminder stopped.")
 
 def save_subscription(chat_id: int, city: str, time_str: str, tz_str: str):
     with psycopg2.connect(DATABASE_URL) as conn:
@@ -629,6 +762,8 @@ def main():
     app.add_handler(CommandHandler("setdaily", setdaily_command))
     app.add_handler(CommandHandler("viewdaily", viewdaily_command))
     app.add_handler(CommandHandler("canceldaily", canceldaily_command))
+    app.add_handler(CommandHandler("setreminder", set_reminder))
+    app.add_handler(CommandHandler("stopreminder", stop_reminder))
     restore_subscriptions(app)
     print("Bot`s running.")
     app.run_polling()
